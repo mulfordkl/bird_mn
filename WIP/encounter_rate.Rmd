@@ -16,60 +16,74 @@ library(ebirdst)
 library(fields)
 library(gridExtra)
 library(tidyverse)
+library(here)
+
+# TidyModels
+library(rsample)
+library(recipes)
+library(parsnip)
+library(tune)
+library(dials)
+library(workflows)
+library(yardstick)
+
+library(doParallel)
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel()
+
 # resolve namespace conflicts
 select <- dplyr::select
 map <- purrr::map
 projection <- raster::projection
 ```
 
-```{r}
-# set random number seed to insure fully repeatable results
-set.seed(1)
+```{r Paths to Relevant Files}
+# Random Seed
+set.seed(5)
 
-# setup output directory for saved results
-if (!dir.exists("output")) {
-  dir.create("output")
-}
+# Data Files and Output Directory
+output_dir <- here("output")
+ebird_file <- here("data", "ebd_whbrnuthatch_yearround_mn_zf.csv")
+habitat_file <- here("data", "pland-elev_location-year.csv")
+pred_surf_file <- here("data", "pland-elev_prediction-surface.csv")
+surface_tif_file <- here("data", "prediction-surface.tif")
+geopackage_file <- here("data", "gis-data.gpkg")
+```
 
-# ebird data
-ebird <- read_csv("data/ebd_whbrnuthatch_may_mn_zf.csv") %>% 
-  # year required to join to habitat data
-  mutate(year = year(observation_date))
+```{r Load eBird and Geo Data}
+# Load eBird data
+ebird <- read_csv(ebird_file) %>% 
+  mutate(year = year(observation_date)) # Get Year for joining with habitat data
 
-# modis habitat covariates
-habitat <- read_csv("data/pland-elev_location-year.csv") %>% 
+# MODIS habitat covariates
+habitat <- read_csv(habitat_file) %>% 
   mutate(year = as.integer(year))
 
 # combine ebird and habitat data
 ebird_habitat <- inner_join(ebird, habitat, by = c("locality_id", "year"))
 
-# prediction surface
-pred_surface <- read_csv("data/pland-elev_prediction-surface.csv")
-# latest year of landcover data
+# Load the prediction surface
+pred_surface <- read_csv(pred_surf_file)
 max_lc_year <- max(pred_surface$year)
-r <- raster("data/prediction-surface.tif")
+prediction_surface_raster <- raster(surface_tif_file)
 
-# load gis data for making maps
+# Load GIS data from geopackage
 map_proj <- st_crs("ESRI:102003")
-ne_land <- read_sf("data/gis-data.gpkg", "ne_land") %>% 
+ne_land <- read_sf(geopackage_file, "ne_land") %>% 
   st_transform(crs = map_proj) %>% 
   st_geometry()
-
-mn <- file.path("data", "tl_2016_27_cousub", "tl_2016_27_cousub.shp") %>% 
-  read_sf() %>%
+mn <- read_sf(geopackage_file, "mn") %>%
   st_transform(crs = map_proj) %>%
   st_geometry()
-
-ne_country_lines <- read_sf("data/gis-data.gpkg", "ne_country_lines") %>% 
+ne_country_lines <- read_sf(geopackage_file, "ne_country_lines") %>% 
   st_transform(crs = map_proj) %>% 
   st_geometry()
-ne_state_lines <- read_sf("data/gis-data.gpkg", "ne_state_lines") %>% 
+ne_state_lines <- read_sf(geopackage_file, "ne_state_lines") %>% 
   st_transform(crs = map_proj) %>% 
   st_geometry()
-
-
 ```
-```{r}
+
+```{r Grid Based UnderSampling}
 
 # generate hexagonal grid with ~ 5 km betweeen cells
 dggs <- dgconstruct(spacing = 5)
@@ -98,26 +112,129 @@ count(ebird_ss, species_observed) %>%
 
 ```
 
-
-```{r}
-ebird_split <- ebird_ss %>% 
-  # select only the columns to be used in the model
-  select(species_observed,
-         year, day_of_year,
-         time_observations_started, duration_minutes,
-         effort_distance_km, number_observers, 
+```{r Split into Train/Test}
+ebird_split <- ebird_habitat %>%
+  mutate(month = month(observation_date, label = FALSE),
+         species_observed = species_observed) %>%
+  select(species_observed, 
+         month,
+         year, 
+         day_of_year,
          starts_with("pland_"),
          starts_with("elevation_")) %>% 
   drop_na()
+  
 # split 80/20
-ebird_split <- ebird_split %>% 
-  split(if_else(runif(nrow(.)) <= 0.8, "train", "test"))
-map_int(ebird_split, nrow)
+ebird_split <- rsample::initial_split(
+  ebird_split,
+  prop = 0.8,
+  strata = month  
+)
 
-detection_freq <- mean(ebird_split$train$species_observed)
+ebird_train <- training(ebird_split) 
+ebird_test <- testing(ebird_split)
 
 ```
+
 ```{r}
+xgb_model <- parsnip::boost_tree(
+  mode = "classification",
+  trees = 40,
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune()
+) %>%
+  set_engine("xgboost")
+```
+
+```{r}
+xgb_params <- dials::parameters(
+  min_n(),
+  tree_depth(),
+  learn_rate(),
+  loss_reduction()
+)
+
+xgb_grid <- dials::grid_max_entropy(
+  xgb_params,
+  size = 25
+)
+
+xgb_wf <- workflows::workflow() %>%
+  add_model(xgb_model) %>%
+  add_formula(species_observed ~ .)
+
+xgb_tuned <- tune::tune_grid(
+  object = xgb_wf,
+  resamples = ebird_train,
+  grid = xgb_grid,
+  metrics = yardstick::metric_set(spec, sens, accuracy, roc_auc),
+  control = tune::control_grid(verbose = TRUE)  
+  
+)
+```
+
+```{r}
+xgb_tuned %>%
+  tune::show_best(metric = "roc_auc")
+
+xgb_best_params <- xgb_tuned %>%
+  tune::select_best("roc_auc")
+
+xbg_finalmodel <- xgb_model %>%
+  finalize_model(xgb_best_params)
+```
+
+```{r Train XGBoost}
+library(xgboost)
+
+ebird_train_label <- pull(ebird_train, species_observed)
+ebird_train <- ebird_train %>%
+  select(-species_observed)
+ebird_test_label <- pull(ebird_test, species_observed)
+ebird_test <- ebird_test %>%
+  select(-species_observed)
+
+bstDMatrix <- xgb.cv(data = as.matrix(ebird_train),
+                     label = ebird_train_label,
+                     max.depth = 12, 
+                     eta = 0.05, 
+                     nfold=5, 
+                     nthread = 4, 
+                     nrounds = 800,
+                     early_stopping_rounds = 3,
+                     print_every_n = 20,
+                     eval_metric = "auc")
+
+
+ebird_gbm_model <- xgb.train(data = ebird_train_dmat,
+                             max.depth = 12, 
+                             eta = 0.05, 
+                             nthread = 4, 
+                             nrounds = 800,
+                             print_every_n = 20,
+                             eval_metric = c("auc"))
+
+```
+
+```{r Predict and Evaluate XGBooost}
+xgb_prediction <- tibble(pred_raw = predict(ebird_gbm_model, as.matrix(ebird_test))) %>%
+  mutate(pred_class = as.factor(as.integer(ifelse(pred_raw > 0.5, 1, 0)))) %>%
+  bind_cols(., ebird_test_label) %>%
+  rename("test_label" = "...3" ) %>%
+  mutate(test_label = as.factor(as.integer(test_label)),
+         correct = ifelse(pred_class == test_label, 1, 0)) 
+
+error_rate <- xgb_prediction %>%
+  group_by(correct) %>%
+  summarize(rate = n() / nrow(xgb_prediction))
+  
+```
+
+
+
+```{r Train Ranger}
 # ranger requires a factor response to do classification
 ebird_split$train$species_observed <- factor(ebird_split$train$species_observed)
 # grow random forest
@@ -128,6 +245,8 @@ rf <- ranger(formula =  species_observed ~ .,
              replace = TRUE, 
              sample.fraction = c(detection_freq, detection_freq))
 ```
+
+
 
 ```{r}
 # make predictions on training data
@@ -217,6 +336,8 @@ rf_assessment <- tibble(
 )
 knitr::kable(rf_assessment, digits = 3)
 ```
+
+
 ```{r}
 pi <- enframe(rf$variable.importance, "predictor", "importance")
 # plot
@@ -232,6 +353,8 @@ ggplot(pi) +
   theme(panel.grid = element_blank(),
         panel.grid.major.x = element_line(colour = "#cccccc", size = 0.5))
 ```
+
+
 ```{r}
 # top 9 predictors other than date
 top_pred <- pi %>% 
@@ -384,9 +507,9 @@ pred_er <- bind_cols(pred_surface_eff, encounter_rate = pred_rf_cal) %>%
 r_pred <- pred_er %>% 
   # convert to spatial features
   st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>% 
-  st_transform(crs = projection(r)) %>% 
+  st_transform(crs = projection(prediction_surface_raster)) %>% 
   # rasterize
-  rasterize(r)
+  rasterize(prediction_surface_raster)
 r_pred <- r_pred[[-1]]
 
 # save the raster
@@ -394,7 +517,7 @@ tif_dir <- "output"
 if (!dir.exists(tif_dir)) {
   dir.create(tif_dir)
 }
-writeRaster(r_pred, file.path(tif_dir, "rf-model_encounter-rate_woothr.tif"), 
+writeRaster(r_pred, file.path(tif_dir, "rf-model_encounter-rate_nuth.tif"), 
             overwrite = TRUE)
 ```
 ```{r}

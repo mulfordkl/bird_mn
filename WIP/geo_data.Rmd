@@ -20,7 +20,7 @@ map <- purrr::map
 projection <- raster::projection
 
 # load ebird data
-ebird <- read_csv(here("data", "ebd_whbrnuthatch_may_mn_zf.csv"))
+ebird <- read_csv(here("data", "ebd_whbrnuthatch_yearround_mn_zf.csv"))
 # get list of tiles required to cover this bcr
 tiles <- getTile(extent = list(xmin = -98, xmax = -89, ymax = 49.5, ymin = 43))
 ```
