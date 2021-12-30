@@ -3,7 +3,11 @@ title: "R Notebook"
 output: html_notebook
 ---
 
-```{r include=FALSE, echo=FALSE}
+In the last post about eBird data I went through how I acquired, cleaned, and explored the dataset. In this project, I am exploring how the eBird data can be used to model the encounter rate of the White Breasted Nuthatch in Minnesota. As with the last post, I have been heavily referencing the eBird best practices eBook. The first task is to load the large number of libraries we will be using.  
+
+## Setup
+
+```{r Load Libraries, results="hide"}
 library(sf)
 library(raster)
 library(dggridR)
@@ -17,15 +21,11 @@ library(fields)
 library(gridExtra)
 library(tidyverse)
 library(here)
-
-# TidyModels
+library(ghibli)
 library(rsample)
-library(recipes)
-library(parsnip)
-library(tune)
-library(dials)
-library(workflows)
-library(yardstick)
+library(pdp)
+library(vip)
+
 
 library(doParallel)
 all_cores <- parallel::detectCores(logical = FALSE)
@@ -36,6 +36,8 @@ select <- dplyr::select
 map <- purrr::map
 projection <- raster::projection
 ```
+
+And to set the paths of our data sets.
 
 ```{r Paths to Relevant Files}
 # Random Seed
@@ -50,7 +52,9 @@ surface_tif_file <- here("data", "prediction-surface.tif")
 geopackage_file <- here("data", "gis-data.gpkg")
 ```
 
-```{r Load eBird and Geo Data}
+And now we can load our files.
+
+```{r Load eBird and Geo Data, results='hide'}
 # Load eBird data
 ebird <- read_csv(ebird_file) %>% 
   mutate(year = year(observation_date)) # Get Year for joining with habitat data
@@ -83,10 +87,16 @@ ne_state_lines <- read_sf(geopackage_file, "ne_state_lines") %>%
   st_geometry()
 ```
 
+## Data Subsampling and Spatial Bias
+
+Here we will implement grid based undersampling, which is primarily a method for countering spatial bias in data. Unlike non-spatial data sets, spatial data does not usually obey the statistical idea of sampling from an independent and identically distributed random variable. You can think about it this way - Starbucks are not evenly distributed throughout a state, they appear in population centers. As a result, the parameters of the sample (the location) affect the probability that we will observe something. This becomes a major problem in eBird data, where most checklists are completed near where the person completing the checklist lives, so the actual checklists are clustered around population centers. If you look at the map at the end of my last eBird post, this trend is clear. One way to counter this is to subsample checklists in a grid. This can also be used to fix some class imbalance issues by subsampling according to whether or not the checklist observed the species in question. In the eBird Best Practices book, they look at the Wood Thrush, a rarer species than the White-Breasted Nuthatch. They also look at a much larger area than Minnesota - so we will adjust some of the parameters to match our scenario.
+
+I also trained the model on the whole data set and model performance on the test set was consistently stronger on the whole data set versus the sub-sampled data set. This was somewhat surprising to me, as both eBird best practices and the linked paper (ADD HERE) suggested that the reduction of spatial bias would increase model accuracy when predicting encounter rate from land cover covariates. Perhaps this effect is small for a species without a big class imbalance, and so the reduction in model performance from the decrease in overall data has a larger effect than the spatial bias?
+
 ```{r Grid Based UnderSampling}
 
 # generate hexagonal grid with ~ 5 km betweeen cells
-dggs <- dgconstruct(spacing = 5)
+dggs <- dgconstruct(spacing = 1)
 # get hexagonal cell id and week number for each checklist
 checklist_cell <- ebird_habitat %>% 
   mutate(cell = dgGEO_to_SEQNUM(dggs, longitude, latitude)$seqnum,
@@ -111,83 +121,31 @@ count(ebird_ss, species_observed) %>%
 
 
 ```
+This process would reduce our data by a factor of about 2, while slightly increasing the proportion of checklists with a sighting. 
+
+Note - for the reasons explained above, the rest of the post performs the analysis without sub-sampling. Next, since we will be building a random forest model to estimate encounter rate, I split the data into train and testing sets. For this analysis we will focus on the month of May, which had altogether the most sightings of Nuthatches (and the most checklists), but not the highest proportion of checklists with a sighting among months. Note that here I am selecting a subset of the variables, specifically the landcover and elevation covariates as well as the year and day. 
+
 
 ```{r Split into Train/Test}
 ebird_split <- ebird_habitat %>%
-  mutate(month = month(observation_date, label = FALSE),
+    mutate(month = month(observation_date, label = FALSE),
          species_observed = species_observed) %>%
-  select(species_observed, 
-         month,
-         year, 
-         day_of_year,
-         starts_with("pland_"),
-         starts_with("elevation_")) %>% 
-  drop_na()
+    filter(month == 2) %>%
+    select(species_observed, 
+           year, 
+           day_of_year,
+           starts_with("pland_"),
+           starts_with("elevation_")) %>% 
+    drop_na()
   
 # split 80/20
 ebird_split <- rsample::initial_split(
   ebird_split,
-  prop = 0.8,
-  strata = month  
+  prop = 0.8 
 )
 
 ebird_train <- training(ebird_split) 
 ebird_test <- testing(ebird_split)
-
-```
-
-```{r}
-xgb_model <- parsnip::boost_tree(
-  mode = "classification",
-  trees = 40,
-  min_n = tune(),
-  tree_depth = tune(),
-  learn_rate = tune(),
-  loss_reduction = tune()
-) %>%
-  set_engine("xgboost")
-```
-
-```{r}
-xgb_params <- dials::parameters(
-  min_n(),
-  tree_depth(),
-  learn_rate(),
-  loss_reduction()
-)
-
-xgb_grid <- dials::grid_max_entropy(
-  xgb_params,
-  size = 25
-)
-
-xgb_wf <- workflows::workflow() %>%
-  add_model(xgb_model) %>%
-  add_formula(species_observed ~ .)
-
-xgb_tuned <- tune::tune_grid(
-  object = xgb_wf,
-  resamples = ebird_train,
-  grid = xgb_grid,
-  metrics = yardstick::metric_set(spec, sens, accuracy, roc_auc),
-  control = tune::control_grid(verbose = TRUE)  
-  
-)
-```
-
-```{r}
-xgb_tuned %>%
-  tune::show_best(metric = "roc_auc")
-
-xgb_best_params <- xgb_tuned %>%
-  tune::select_best("roc_auc")
-
-xbg_finalmodel <- xgb_model %>%
-  finalize_model(xgb_best_params)
-```
-
-```{r Train XGBoost}
-library(xgboost)
 
 ebird_train_label <- pull(ebird_train, species_observed)
 ebird_train <- ebird_train %>%
@@ -196,131 +154,92 @@ ebird_test_label <- pull(ebird_test, species_observed)
 ebird_test <- ebird_test %>%
   select(-species_observed)
 
-bstDMatrix <- xgb.cv(data = as.matrix(ebird_train),
-                     label = ebird_train_label,
-                     max.depth = 12, 
-                     eta = 0.05, 
-                     nfold=5, 
-                     nthread = 4, 
-                     nrounds = 800,
-                     early_stopping_rounds = 3,
-                     print_every_n = 20,
-                     eval_metric = "auc")
-
-
-ebird_gbm_model <- xgb.train(data = ebird_train_dmat,
-                             max.depth = 12, 
-                             eta = 0.05, 
-                             nthread = 4, 
-                             nrounds = 800,
-                             print_every_n = 20,
-                             eval_metric = c("auc"))
 
 ```
 
-```{r Predict and Evaluate XGBooost}
-xgb_prediction <- tibble(pred_raw = predict(ebird_gbm_model, as.matrix(ebird_test))) %>%
-  mutate(pred_class = as.factor(as.integer(ifelse(pred_raw > 0.5, 1, 0)))) %>%
-  bind_cols(., ebird_test_label) %>%
-  rename("test_label" = "...3" ) %>%
-  mutate(test_label = as.factor(as.integer(test_label)),
-         correct = ifelse(pred_class == test_label, 1, 0)) 
+## Model training and calbration
 
-error_rate <- xgb_prediction %>%
-  group_by(correct) %>%
-  summarize(rate = n() / nrow(xgb_prediction))
-  
-```
-
-
+Finally we will train our random forest - using some sensible defaults. 
 
 ```{r Train Ranger}
-# ranger requires a factor response to do classification
-ebird_split$train$species_observed <- factor(ebird_split$train$species_observed)
-# grow random forest
-rf <- ranger(formula =  species_observed ~ ., 
-             data = ebird_split$train,
+ebird_train_rf <- bind_cols(ebird_train_label, ebird_train) %>%
+    rename(species_observed = "...1")
+rf <- ranger(formula =  as.factor(species_observed) ~ ., 
+             data = ebird_train_rf,
              importance = "impurity",
              probability = TRUE,
              replace = TRUE, 
-             sample.fraction = c(detection_freq, detection_freq))
+             sample.fraction = c(.3, 0.3))
 ```
-
-
+We can check the calibration of the model by plotting the predicted encounter rate against the observed encounter rate. Additionally we can smooth the output of our model by fitting a generative additive model (a version of non-linear spline regression) from the predictions of the random forest to the observed encounter labels. 
 
 ```{r}
-# make predictions on training data
-occ_pred <- rf$predictions[, 2]
-# convert the observered response back to a numeric value from factor
-occ_obs <- ebird_split$train$species_observed %>% 
-  as.logical() %>% 
-  as.integer()
-rf_pred_train <- tibble(obs = occ_obs, pred = occ_pred) %>% 
-  drop_na()
+rf_calib_data <- tibble(
+    observed = ebird_train_label,
+    rf_pred = rf$predictions[,2]
+)
 
-# fit calibration model
-calibration_model <- scam(obs ~ s(pred, k = 5, bs = "mpi"), 
-                          gamma = 1.4,
-                          data = rf_pred_train)
+rf_calibration <- scam(observed ~ s(rf_pred, k = 7, bs = "mpi"), 
+                       gamma = 1.4,
+                       data = rf_calib_data)
 
-# calculate the average observed encounter rates for different 
-# categories of estimated encounter rates 
-
-average_encounter <- rf_pred_train %>%
-  mutate(pred_cat = cut(rf_pred_train$pred, breaks = seq(0, 1, by=0.02))) %>%
+average_encounter <- rf_calib_data %>%
+  mutate(pred_cat = cut(rf_calib_data$rf_pred, breaks = seq(0, 1, by=0.02))) %>%
   group_by(pred_cat) %>%
-  summarise(pred = mean(pred), obs = mean(obs), checklist_count = n()) %>%
+  summarise(pred = mean(rf_pred), train_label = mean(observed), checklist_count = n()) %>%
   ungroup()
 
 # plot
-cal_pred <- tibble(pred = seq(0, 1, length.out = 100))
-cal_pred <- predict(calibration_model, cal_pred, type = "response") %>% 
-  bind_cols(cal_pred, calibrated = .)
-ggplot(cal_pred) +
-  aes(x = pred, y = calibrated) +
+rf_cal_pred <- tibble(rf_pred = seq(0, 1, length.out = 100)) %>%
+    mutate(calibrated = predict(rf_calibration, ., type = "response"))
+
+ggplot(rf_cal_pred) +
+  aes(x = rf_pred, y = calibrated) +
   geom_line() +
   geom_point(data = average_encounter, 
-             aes(x = pred, y = obs, size = sqrt(checklist_count)),
+             aes(x = pred, y = train_label, size = sqrt(checklist_count)),
              show.legend = FALSE, shape = 1) +
-  labs(x = "Estimated encounter rate",
-       y = "Observed encounter rate",
-       title = "Calibration model")
+  labs(x = "Estimated Encounter Rate",
+       y = "Observed Encounter Rate",
+       title = "Calibration Model") +
+    theme_bw()
+
+
 ```
+
+What I can see here is that our model consistently underestimates the encounter rate but does a better job near the upper limit of predicted encounter rate. We can now calculate some model performance metrics on the held-out test set.
 
 ```{r}
 # predict on test data using calibrated model
-p_fitted <- predict(rf, data = ebird_split$test, type = "response")
-# extract probability of detection
-p_fitted <- p_fitted$predictions[, 2]
-# calibrate
-p_calibrated <- predict(calibration_model, 
-                        newdata = tibble(pred = p_fitted), 
-                        type = "response")
-rf_pred_test <- data.frame(id = seq_along(p_calibrated),
-                           # actual detection/non-detection
-                           obs = ebird_split$test$species_observed,
-                           # uncalibrated prediction
-                           fit = p_fitted,
-                           # calibrated prediction
-                           cal = p_calibrated) %>%
-  # constrain probabilities to 0-1
-  mutate(cal = pmin(pmax(cal, 0), 1)) %>% 
-  drop_na()
+rf_fitted <- tibble(rf_pred = predict(rf, data = ebird_test)$predictions[,2],
+                    obs = as.integer(ebird_test_label)) %>%
+    mutate(model_pred_cal = predict(rf_calibration, ., type = "response")) %>%
+    mutate(rf_pred = pmin(pmax(rf_pred, 0), 1),
+           model_pred_cal = pmin(pmax(model_pred_cal, 0), 1)) %>%
+    mutate(id = seq_along(rf_pred),
+           obs = as.integer(as.logical(obs))) %>%
+    drop_na() %>%
+    rename(
+        fit = rf_pred,
+        cal = model_pred_cal
+    ) %>%
+    relocate(obs) %>%
+    relocate(id)
 
 # mean squared error (mse)
-mse_fit <- mean((rf_pred_test$obs - rf_pred_test$fit)^2, na.rm = TRUE)
-mse_cal <- mean((rf_pred_test$obs - rf_pred_test$cal)^2, na.rm = TRUE)
+mse_fit <- mean((rf_fitted$obs - rf_fitted$fit)^2, na.rm = TRUE)
+mse_cal <- mean((rf_fitted$obs - rf_fitted$cal)^2, na.rm = TRUE)
 
 # pick threshold to maximize kappa
-opt_thresh <- optimal.thresholds(rf_pred_test, opt.methods = "MaxKappa")
+opt_thresh <- optimal.thresholds(rf_fitted, opt.methods = "MaxKappa")
 
 # calculate accuracy metrics: auc, kappa, sensitivity, specificity,
-metrics_fit <- rf_pred_test %>% 
+metrics_fit <- rf_fitted %>% 
   select(id, obs, fit) %>% 
   presence.absence.accuracy(threshold = opt_thresh$fit, 
                             na.rm = TRUE, 
                             st.dev = FALSE)
-metrics_cal <- rf_pred_test %>% 
+metrics_cal <- rf_fitted %>% 
   select(id, obs, cal) %>% 
   presence.absence.accuracy(threshold = opt_thresh$cal, 
                             na.rm = TRUE, 
@@ -328,177 +247,54 @@ metrics_cal <- rf_pred_test %>%
 
 rf_assessment <- tibble(
   model = c("RF", "Calibrated RF"),
-  mse = c(mse_fit, mse_cal),
-  sensitivity = c(metrics_fit$sensitivity, metrics_cal$sensitivity),
-  specificity = c(metrics_fit$specificity, metrics_cal$specificity),
-  auc = c(metrics_fit$AUC, metrics_cal$AUC),
-  kappa = c(metrics_fit$Kappa, metrics_cal$Kappa)
+  MSE = c(mse_fit, mse_cal),
+  Sensitivity = c(metrics_fit$sensitivity, metrics_cal$sensitivity),
+  Specificity = c(metrics_fit$specificity, metrics_cal$specificity),
+  AUC = c(metrics_fit$AUC, metrics_cal$AUC),
+  Kappa = c(metrics_fit$Kappa, metrics_cal$Kappa)
 )
-knitr::kable(rf_assessment, digits = 3)
+knitr::kable(rf_assessment, digits = 3) 
 ```
+The GAM-calibrated forest has a small decrease in MSE but in general does not affect the metrics of the random forest. 
+
+## Variable Importance
 
 
 ```{r}
-pi <- enframe(rf$variable.importance, "predictor", "importance")
-# plot
-ggplot(pi) + 
-  aes(x = fct_reorder(predictor, importance), y = importance) +
-  geom_col() +
-  geom_hline(yintercept = 0, size = 2, colour = "#555555") +
-  scale_y_continuous(expand = c(0, 0)) +
-  coord_flip() +
-  labs(x = NULL, 
-       y = "Predictor Importance (Gini Index)") +
-  theme_minimal() +
-  theme(panel.grid = element_blank(),
-        panel.grid.major.x = element_line(colour = "#cccccc", size = 0.5))
-```
+vip(rf) + 
+    theme_bw() + 
+    labs(title = "Random Forest Variable Importance") +
+    ylab("Importance (Gini Index)")
 
-
-```{r}
-# top 9 predictors other than date
-top_pred <- pi %>% 
-  filter(!predictor %in% c("year", "day_of_year")) %>% 
-  top_n(n = 9, wt = importance) %>% 
-  arrange(desc(importance))
-```
-
-```{r}
-# function to calculate partial dependence for a single predictor
-calculate_pd <- function(predictor, model, data, 
-                         x_res = 25, n = 1000) {
-  # create prediction grid
-  rng <- range(data[[predictor]], na.rm = TRUE)
-  x_grid <- seq(rng[1], rng[2], length.out = x_res)
-  grid <- data.frame(covariate = predictor, x = x_grid, 
-                     stringsAsFactors = FALSE)
-  names(grid) <- c("covariate", predictor)
-  
-  # subsample training data
-  n <- min(n, nrow(data))
-  s <- sample(seq.int(nrow(data)), size = n, replace = FALSE)
-  data <- data[s, ]
-  
-  # drop focal predictor from data
-  data <- data[names(data) != predictor]
-  grid <- merge(grid, data, all = TRUE)
-  
-  # predict
-  p <- predict(model, data = grid)
-  
-  # summarize
-  pd <- grid[, c("covariate", predictor)]
-  names(pd) <- c("covariate", "x")
-  pd$pred <- p$predictions[, 2]
-  pd <- dplyr::group_by(pd, covariate, x) %>% 
-    dplyr::summarise(pred = mean(pred, na.rm = TRUE)) %>% 
-    dplyr::ungroup()
-  
-  return(pd)
-}
-```
-
-```{r}
-# calculate partial dependence for each predictor
-# map is used to iteratively apply calculate_pd to each predictor
-pd <- top_pred %>% 
-  mutate(pd = map(predictor, calculate_pd, model = rf, 
-                  data = ebird_split$train),
-         pd = map(pd, ~ .[, c(2, 3)]),
-         pd = map(pd, set_names, nm = c("value",  "encounter_rate"))) %>% 
-  unnest(cols = pd)
-
-# calibrate predictions
-pd$encounter_rate <- predict(calibration_model, 
-                             newdata = tibble(pred = pd$encounter_rate), 
-                             type = "response") %>% 
-  as.numeric()
-  
-# plot
-ggplot(pd) +
-  aes(x = value, y = encounter_rate) +
-  geom_line() +
-  geom_point() +
-  scale_y_continuous(labels = scales::percent) +
-  facet_wrap(~ as_factor(predictor), nrow = 3, scales = "free") +
-  labs(x = NULL, y = "Encounter Rate") +
-  theme_minimal() +
-  theme_minimal() +
-  theme(panel.grid = element_blank(),
-        axis.line = element_line(color = "grey60"),
-        axis.ticks  = element_line(color = "grey60"))
-```
-
-```{r}
-# find peak time of day from partial dependence
-pd_time <- calculate_pd("time_observations_started",
-                        model = rf, 
-                        data = ebird_split$train,
-                        # make estimates at 30 minute intervals
-                        # using a subset of the training dataset
-                        x_res = 2 * 24, n = 1000) %>% 
-  transmute(time_observations_started = x, encounter_rate = pred)
-
-# histogram
-g_hist <- ggplot(ebird_split$train) +
-  aes(x = time_observations_started) +
-  geom_histogram(binwidth = 1, center = 0.5, color = "grey30",
-                 fill = "grey50") +
-  scale_x_continuous(breaks = seq(0, 24, by = 3)) +
-  scale_y_continuous(labels = scales::comma) +
-  labs(x = "Hours since midnight",
-       y = "# checklists",
-       title = "Distribution of observation start times")
-
-# gam
-g_pd <- ggplot(pd_time) +
-  aes(x = time_observations_started, y = encounter_rate) +
-  geom_line() +
-  scale_x_continuous(breaks = seq(0, 24, by = 3)) +
-  labs(x = "Hours since midnight",
-       y = "Probability of reporting",
-       title = "Observation start time partial dependence")
-
-# combine
-grid.arrange(g_hist, g_pd)
-```
-```{r}
-# hours with at least 1% of checklists
-search_hours <- ebird_split$train %>% 
-  mutate(hour = floor(time_observations_started)) %>%
-  count(hour) %>% 
-  mutate(pct = n / sum(n)) %>% 
-  filter(pct >= 0.01)
-
-# constrained peak time
-t_peak <- pd_time %>% 
-  filter(floor(time_observations_started) %in% search_hours$hour) %>% 
-  top_n(1, wt = desc(time_observations_started)) %>% 
-  pull(time_observations_started)
-t_peak
+pdp::partial(rf, pred.var = "pland_12_cropland", plot = TRUE)  # Figure 2
 
 ```
+
+## Plotting Encounter Rate
 
 ```{r}
 # add effort covariates to prediction 
 pred_surface_eff <- pred_surface %>% 
-  mutate(observation_date = ymd(str_glue("{max_lc_year}-06-15")),
-         year = year(observation_date),
-         day_of_year = yday(observation_date),
-         time_observations_started = t_peak,
-         duration_minutes = 60,
-         effort_distance_km = 1,
-         number_observers = 1)
+    mutate(month = 5,
+           day_of_year = 15) %>%
+    relocate(month, .before = year) %>%
+    relocate(day_of_year, .after = year)
 
-# predict
-pred_rf <- predict(rf, data = pred_surface_eff, type = "response")
+pred_surface_loc <- tibble(
+    id = pred_surface_eff$id,
+    longitude = pred_surface_eff$longitude,
+    latitude = pred_surface_eff$latitude
+)
+
+pred_rf <- predict(rf, data = as.matrix(pred_surface_eff), type = "response")
+    
 pred_rf <- pred_rf$predictions[, 2]
 # apply calibration models
-pred_rf_cal <- predict(calibration_model, 
-                       data.frame(pred = pred_rf), 
-                       type = "response")
+pred_rf_cal <- tibble(pred_rf_cal = predict(rf_calibration, 
+                       data.frame(rf_pred = pred_rf), 
+                       type = "response"))
 # add to prediction surface
-pred_er <- bind_cols(pred_surface_eff, encounter_rate = pred_rf_cal) %>% 
+pred_er <- bind_cols(pred_surface_loc, encounter_rate = pred_rf_cal$pred_rf_cal) %>% 
   select(latitude, longitude, encounter_rate) %>% 
   mutate(encounter_rate = pmin(pmax(encounter_rate, 0), 1))
 ```
@@ -511,53 +307,70 @@ r_pred <- pred_er %>%
   # rasterize
   rasterize(prediction_surface_raster)
 r_pred <- r_pred[[-1]]
-
-# save the raster
-tif_dir <- "output"
-if (!dir.exists(tif_dir)) {
-  dir.create(tif_dir)
-}
-writeRaster(r_pred, file.path(tif_dir, "rf-model_encounter-rate_nuth.tif"), 
-            overwrite = TRUE)
-```
-```{r}
-# project predictions
 r_pred_proj <- projectRaster(r_pred, crs = map_proj$proj4string, method = "ngb")
 
-par(mar = c(3.5, 0.25, 0.25, 0.25))
-# set up plot area
-plot(mn, col = NA, border = NA)
-plot(ne_land, col = "#dddddd", border = "#888888", lwd = 0.5, add = TRUE)
+r_pred_proj_spdf = as(r_pred_proj, "SpatialPixelsDataFrame")
+raster_df <- as.data.frame(r_pred_proj_spdf)
+```
 
-# encounter rate
-r_max <- ceiling(10 * cellStats(r_pred_proj, max)) / 10
-brks <- seq(0, r_max, by = 0.025)
-lbl_brks <- seq(0, r_max, by = 0.1)
-# ebird status and trends color palette
-pal <- abundance_palette(length(brks) - 1)
-plot(r_pred_proj, 
-     col = pal, breaks = brks, 
-     maxpixels = ncell(r_pred_proj),
-     legend = FALSE, add = TRUE)
+```{r}
+mn_bound <- read_sf(here("data", "bdry_state_of_minnesota.gpkg")) %>% 
+  st_transform(crs = map_proj) %>% 
+  st_geometry()
+    
+```
 
-# borders
-#plot(mn, border = "#000000", col = NA, lwd = 1, add = TRUE)
-plot(ne_state_lines, col = "#ffffff", lwd = 0.75, add = TRUE)
-plot(ne_country_lines, col = "#ffffff", lwd = 1.5, add = TRUE)
-box()
 
-# legend
-par(new = TRUE, mar = c(0, 0, 0, 0))
-title <- "Wood Thrush Encounter Rate"
-image.plot(zlim = range(brks), legend.only = TRUE, 
-           col = pal, breaks = brks,
-           smallplot = c(0.25, 0.75, 0.06, 0.09),
-           horizontal = TRUE,
-           axis.args = list(at = lbl_brks, labels = lbl_brks,
-                            fg = "black", col.axis = "black",
-                            cex.axis = 0.75, lwd.ticks = 0.5,
-                            padj = -1.5),
-           legend.args = list(text = title,
-                              side = 3, col = "black",
-                              cex = 1, line = 0))
+```{r}
+
+get_display_window <- function(lat, long, zoom) {
+  zoom_to <- c(lat, long)
+  zoom_level <- 5
+  
+  # Lambert azimuthal equal-area projection around center of interest
+  target_crs <- map_proj$proj4string
+  
+  C <- 40075016.686   # ~ circumference of Earth in meters
+  x_span <- C / 2^(zoom_level+0.5)
+  y_span <- C / 2^(zoom_level+0.95)
+  
+  zoom_to_xy <- st_transform(st_sfc(st_point(zoom_to), crs = 4326),
+                             crs = target_crs)
+  
+  disp_window <- st_sfc(
+      st_point(st_coordinates(zoom_to_xy - c(x_span / 2, y_span / 2))),
+      st_point(st_coordinates(zoom_to_xy + c(x_span / 2, y_span / 2))),
+      crs = target_crs
+  )
+  window_crs <- list(window = disp_window, crs = target_crs)
+  return(window_crs)
+}
+
+window_crs <- get_display_window(-94.3114, 46.278594, 5)
+
+raster_df %>%
+    ggplot(data = .) + 
+    geom_sf(data = ne_land, color = "white") + 
+    geom_sf(data = ne_country_lines, color = "white") + 
+    geom_sf(data = ne_state_lines, color = "white") + 
+    geom_sf(data = mn_bound, color = "black", size = 1.5) + 
+    geom_raster(mapping = aes(x = x, y = y, fill = encounter_rate)) + 
+    coord_sf(xlim = st_coordinates(window_crs$window)[,'X'],
+             ylim = st_coordinates(window_crs$window)[,'Y'],
+             crs = window_crs$crs, datum = window_crs$crs) + 
+    scale_fill_ghibli_c("YesterdayMedium") + 
+    theme_bw() + 
+    labs(title = "White-Breasted Nuthatch Encounter Rate", 
+         subtitle = "Minnesota, May",
+         caption = "Scale corresponds to probability of encounter at given location.",
+         fill = "Encounter\nRate") + 
+    theme(panel.background = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid = element_blank(),
+          axis.title = element_blank()
+          )
+
+
+
 ```

@@ -1,0 +1,206 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+xgb_model <- parsnip::boost_tree(
+  mode = "classification",
+  trees = 40,
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune()
+) %>%
+  set_engine("xgboost")
+```
+
+```{r}
+xgb_params <- dials::parameters(
+  min_n(),
+  tree_depth(),
+  learn_rate(),
+  loss_reduction()
+)
+
+xgb_grid <- dials::grid_max_entropy(
+  xgb_params,
+  size = 25
+)
+
+xgb_wf <- workflows::workflow() %>%
+  add_model(xgb_model) %>%
+  add_formula(species_observed ~ .)
+
+xgb_tuned <- tune::tune_grid(
+  object = xgb_wf,
+  resamples = ebird_train,
+  grid = xgb_grid,
+  metrics = yardstick::metric_set(spec, sens, accuracy, roc_auc),
+  control = tune::control_grid(verbose = TRUE)  
+  
+)
+```
+
+```{r}
+xgb_tuned %>%
+  tune::show_best(metric = "roc_auc")
+
+xgb_best_params <- xgb_tuned %>%
+  tune::select_best("roc_auc")
+
+xbg_finalmodel <- xgb_model %>%
+  finalize_model(xgb_best_params)
+```
+
+
+
+```{r}
+bstDMatrix <- xgb.cv(data = as.matrix(ebird_train),
+                     label = ebird_train_label,
+                     max.depth = 2, 
+                     eta = 0.02, 
+                     nfold=5, 
+                     nthread = 6, 
+                     nrounds = 2000,
+                     early_stopping_rounds = 3,
+                     print_every_n = 20,
+                     eval_metric = "auc")
+
+```
+
+```{r Train Final Model}
+ebird_gbm_model <- xgboost(data = as.matrix(ebird_train),
+                           label = ebird_train_label,
+                           max.depth = 2, 
+                           eta = 0.02, 
+                           nthread = 8, 
+                           nrounds = 2000,
+                           print_every_n = 50,
+                           eval_metric = c("auc"))
+
+```
+
+```{r Predict and Evaluate XGBooost}
+xgb_prediction <- tibble(pred_raw = predict(ebird_gbm_model, as.matrix(ebird_test))) %>%
+  mutate(pred_class = as.factor(as.integer(ifelse(pred_raw > 0.5, 1, 0)))) %>%
+  bind_cols(., ebird_test_label) %>%
+  rename("test_label" = "...3" ) %>%
+  mutate(test_label = as.factor(as.integer(test_label)),
+         correct = ifelse(pred_class == test_label, 1, 0)) 
+
+error_rate <- xgb_prediction %>%
+  group_by(correct) %>%
+  summarize(rate = n() / nrow(xgb_prediction))
+
+error_rate
+  
+```
+
+
+
+```{r}
+# make predictions on training data
+xgb_prediction_train <- tibble(pred_raw = predict(ebird_gbm_model, as.matrix(ebird_train))) %>%
+    mutate(pred_class = as.integer(ifelse(pred_raw > 0.5, 1, 0))) %>%
+    bind_cols(., ebird_train_label) %>%
+    rename("train_label" = "...3" ) %>%
+    mutate(train_label = as.integer(train_label),
+           correct = ifelse(pred_class == train_label, 1, 0)) %>%
+    drop_na()
+    
+
+# fit calibration model
+calibration_model <- scam(train_label ~ s(pred_raw, k = 7, bs = "mpi"), 
+                          gamma = 1.4,
+                          data = xgb_prediction_train)
+
+average_encounter <- xgb_prediction_train %>%
+  mutate(pred_cat = cut(xgb_prediction_train$pred_raw, breaks = seq(0, 1, by=0.02))) %>%
+  group_by(pred_cat) %>%
+  summarise(pred = mean(pred_raw), train_label = mean(train_label), checklist_count = n()) %>%
+  ungroup()
+
+# plot
+cal_pred <- tibble(pred_raw = seq(0, 1, length.out = 100)) %>%
+    mutate(calibrated = predict(calibration_model, ., type = "response"))
+
+ggplot(cal_pred) +
+  aes(x = pred_raw, y = calibrated) +
+  geom_line() +
+  geom_point(data = average_encounter, 
+             aes(x = pred, y = train_label, size = sqrt(checklist_count)),
+             show.legend = FALSE, shape = 1) +
+  labs(x = "Estimated Encounter Rate",
+       y = "Observed Encounter Rate",
+       title = "Calibration Model") +
+    theme_bw()
+```
+
+```{r}
+# predict on test data using calibrated model
+xgb_fitted <- tibble(pred_raw = predict(ebird_gbm_model, newdata = as.matrix(ebird_test))) %>%
+    mutate(model_pred_cal = predict(calibration_model, ., type = "response")) %>%
+    mutate(pred_raw = pmin(pmax(pred_raw, 0), 1),
+           model_pred_cal = pmin(pmax(model_pred_cal, 0), 1)) %>%
+    bind_cols(., ebird_test_label) %>%
+    rename(obs = "...3") %>%
+    drop_na()
+
+xgb_fitted <- tibble(
+    id = seq_along(xgb_fitted$pred_raw),
+    obs = xgb_fitted$obs,
+    fit = xgb_fitted$pred_raw,
+    cal = xgb_fitted$model_pred_cal
+)
+
+# extract probability of detection
+p_fitted <- p_fitted$predictions[, 2]
+# calibrate
+p_calibrated <- predict(calibration_model, 
+                        newdata = tibble(pred = p_fitted), 
+                        type = "response")
+rf_pred_test <- data.frame(id = seq_along(p_calibrated),
+                           # actual detection/non-detection
+                           obs = ebird_split$test$species_observed,
+                           # uncalibrated prediction
+                           fit = p_fitted,
+                           # calibrated prediction
+                           cal = p_calibrated) %>%
+  # constrain probabilities to 0-1
+  mutate(cal = pmin(pmax(cal, 0), 1)) %>% 
+  drop_na()
+
+# mean squared error (mse)
+mse_fit <- mean((xgb_fitted$obs - xgb_fitted$fit)^2, na.rm = TRUE)
+mse_cal <- mean((xgb_fitted$obs - xgb_fitted$cal)^2, na.rm = TRUE)
+
+# pick threshold to maximize kappa
+opt_thresh <- optimal.thresholds(xgb_fitted, opt.methods = "MaxKappa")
+
+# calculate accuracy metrics: auc, kappa, sensitivity, specificity,
+metrics_fit <- xgb_fitted %>% 
+  select(id, obs, fit) %>% 
+  presence.absence.accuracy(threshold = opt_thresh$fit, 
+                            na.rm = TRUE, 
+                            st.dev = FALSE)
+metrics_cal <- xgb_fitted %>% 
+  select(id, obs, cal) %>% 
+  presence.absence.accuracy(threshold = opt_thresh$cal, 
+                            na.rm = TRUE, 
+                            st.dev = FALSE)
+
+xgb_assessment <- tibble(
+  model = c("XGB", "Calibrated XGB"),
+  mse = c(mse_fit, mse_cal),
+  sensitivity = c(metrics_fit$sensitivity, metrics_cal$sensitivity),
+  specificity = c(metrics_fit$specificity, metrics_cal$specificity),
+  auc = c(metrics_fit$AUC, metrics_cal$AUC),
+  kappa = c(metrics_fit$Kappa, metrics_cal$Kappa)
+)
+knitr::kable(xgb_assessment, digits = 3)
+```
+```{r}
+vip <- xgb.importance(feature_names = colnames(ebird_train), model = ebird_gbm_model)
+knitr::kable(vip, digits = 3)
+```
