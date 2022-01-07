@@ -3,11 +3,13 @@ title: "R Notebook"
 output: html_notebook
 ---
 
-In the last post about eBird data I went through how I acquired, cleaned, and explored the dataset. In this project, I am exploring how the eBird data can be used to model the encounter rate of the White Breasted Nuthatch in Minnesota. As with the last post, I have been heavily referencing the eBird best practices eBook. The first task is to load the large number of libraries we will be using.  
+In the last post about eBird data I went through how I acquired, cleaned, and explored the dataset. In this project, I am exploring how the eBird data can be used to model the encounter rate of the White Breasted Nuthatch in Minnesota. As with the last post, I have been heavily referencing the eBird best practices eBook. 
 
-## Setup
+There are a lot of libraries so you can find them in the session info at the bottom.
 
-```{r Load Libraries, results="hide"}
+#### Setup
+
+```{r Load Libraries, include=FALSE}
 library(sf)
 library(raster)
 library(dggridR)
@@ -25,6 +27,7 @@ library(ghibli)
 library(rsample)
 library(pdp)
 library(vip)
+library(patchwork)
 
 
 library(doParallel)
@@ -37,7 +40,7 @@ map <- purrr::map
 projection <- raster::projection
 ```
 
-And to set the paths of our data sets.
+First we will set the paths to our datasets
 
 ```{r Paths to Relevant Files}
 # Random Seed
@@ -85,9 +88,12 @@ ne_country_lines <- read_sf(geopackage_file, "ne_country_lines") %>%
 ne_state_lines <- read_sf(geopackage_file, "ne_state_lines") %>% 
   st_transform(crs = map_proj) %>% 
   st_geometry()
+mn_bound <- read_sf(here("data", "bdry_state_of_minnesota.gpkg")) %>% 
+  st_transform(crs = map_proj) %>% 
+  st_geometry()
 ```
 
-## Data Subsampling and Spatial Bias
+#### Data Subsampling and Spatial Bias
 
 Here we will implement grid based undersampling, which is primarily a method for countering spatial bias in data. Unlike non-spatial data sets, spatial data does not usually obey the statistical idea of sampling from an independent and identically distributed random variable. You can think about it this way - Starbucks are not evenly distributed throughout a state, they appear in population centers. As a result, the parameters of the sample (the location) affect the probability that we will observe something. This becomes a major problem in eBird data, where most checklists are completed near where the person completing the checklist lives, so the actual checklists are clustered around population centers. If you look at the map at the end of my last eBird post, this trend is clear. One way to counter this is to subsample checklists in a grid. This can also be used to fix some class imbalance issues by subsampling according to whether or not the checklist observed the species in question. In the eBird Best Practices book, they look at the Wood Thrush, a rarer species than the White-Breasted Nuthatch. They also look at a much larger area than Minnesota - so we will adjust some of the parameters to match our scenario.
 
@@ -95,26 +101,21 @@ I also trained the model on the whole data set and model performance on the test
 
 ```{r Grid Based UnderSampling}
 
-# generate hexagonal grid with ~ 5 km betweeen cells
 dggs <- dgconstruct(spacing = 1)
-# get hexagonal cell id and week number for each checklist
 checklist_cell <- ebird_habitat %>% 
   mutate(cell = dgGEO_to_SEQNUM(dggs, longitude, latitude)$seqnum,
          year = year(observation_date),
          week = week(observation_date))
-# sample one checklist per grid cell per week
-# sample detection/non-detection independently 
 ebird_ss <- checklist_cell %>% 
   group_by(species_observed, year, week, cell) %>% 
   sample_n(size = 1) %>% 
   ungroup()
 
 # original data
-nrow(ebird_habitat)
 count(ebird_habitat, species_observed) %>% 
   mutate(percent = n / sum(n))
 
-nrow(ebird_ss)
+# subsampled data
 count(ebird_ss, species_observed) %>% 
   mutate(percent = n / sum(n))
 
@@ -123,14 +124,18 @@ count(ebird_ss, species_observed) %>%
 ```
 This process would reduce our data by a factor of about 2, while slightly increasing the proportion of checklists with a sighting. 
 
-Note - for the reasons explained above, the rest of the post performs the analysis without sub-sampling. Next, since we will be building a random forest model to estimate encounter rate, I split the data into train and testing sets. For this analysis we will focus on the month of May, which had altogether the most sightings of Nuthatches (and the most checklists), but not the highest proportion of checklists with a sighting among months. Note that here I am selecting a subset of the variables, specifically the landcover and elevation covariates as well as the year and day. 
+Note - for the reasons explained above, the rest of the post performs the analysis without sub-sampling. 
+
+### Train and calibrate the model
+
+Next, since we will be building a random forest model to estimate encounter rate, I split the data into train and testing sets. For this analysis we will focus on the month of May, which had altogether the most sightings of Nuthatches (and the most checklists), but not the highest proportion of checklists with a sighting among months. Note that here I am selecting a subset of the variables, specifically the landcover and elevation covariates as well as the year and day. 
 
 
 ```{r Split into Train/Test}
 ebird_split <- ebird_habitat %>%
     mutate(month = month(observation_date, label = FALSE),
          species_observed = species_observed) %>%
-    filter(month == 2) %>%
+    filter(month == 5) %>%
     select(species_observed, 
            year, 
            day_of_year,
@@ -157,11 +162,9 @@ ebird_test <- ebird_test %>%
 
 ```
 
-## Model training and calbration
-
 Finally we will train our random forest - using some sensible defaults. 
 
-```{r Train Ranger}
+```{r Train Ranger, results="hide"}
 ebird_train_rf <- bind_cols(ebird_train_label, ebird_train) %>%
     rename(species_observed = "...1")
 rf <- ranger(formula =  as.factor(species_observed) ~ ., 
@@ -173,7 +176,7 @@ rf <- ranger(formula =  as.factor(species_observed) ~ .,
 ```
 We can check the calibration of the model by plotting the predicted encounter rate against the observed encounter rate. Additionally we can smooth the output of our model by fitting a generative additive model (a version of non-linear spline regression) from the predictions of the random forest to the observed encounter labels. 
 
-```{r}
+```{r Calibration Model}
 rf_calib_data <- tibble(
     observed = ebird_train_label,
     rf_pred = rf$predictions[,2]
@@ -201,16 +204,16 @@ ggplot(rf_cal_pred) +
              show.legend = FALSE, shape = 1) +
   labs(x = "Estimated Encounter Rate",
        y = "Observed Encounter Rate",
-       title = "Calibration Model") +
+       title = "Calibration Curve") +
     theme_bw()
 
 
 ```
 
-What I can see here is that our model consistently underestimates the encounter rate but does a better job near the upper limit of predicted encounter rate. We can now calculate some model performance metrics on the held-out test set.
+What I can see here is that our model consistently overestimates the encounter rate. At an estimated encounter rate of 0.5 the observed rate is only half that. The model does a better job near the upper limit of predicted encounter rate. This means that We can now calculate some model performance metrics on the held-out test set.
 
-```{r}
-# predict on test data using calibrated model
+```{r Model Metrics}
+
 rf_fitted <- tibble(rf_pred = predict(rf, data = ebird_test)$predictions[,2],
                     obs = as.integer(ebird_test_label)) %>%
     mutate(model_pred_cal = predict(rf_calibration, ., type = "response")) %>%
@@ -257,22 +260,66 @@ knitr::kable(rf_assessment, digits = 3)
 ```
 The GAM-calibrated forest has a small decrease in MSE but in general does not affect the metrics of the random forest. 
 
-## Variable Importance
+### Variable Importance
+
+One of the major benefits of forest based models is the ability to rank the importance of an individual variable. The `vip` function ranks variables by their mean contribution to the overall model in terms of their gini index. This plot is shown here:
 
 
-```{r}
+```{r Variable Importance Plot}
 vip(rf) + 
     theme_bw() + 
     labs(title = "Random Forest Variable Importance") +
     ylab("Importance (Gini Index)")
 
-pdp::partial(rf, pred.var = "pland_12_cropland", plot = TRUE)  # Figure 2
-
 ```
+The two most important variables (by this metric) are the two elevation variables. This may make some sense - as nuthatches are less common in the prairies and croplands in the Western part of Minnesota. Going even further, we can observe how changing an individual variable (while keeping all other constant) affects the model's predicted encounter rate. This is called a partial dependence plot - and it can be a useful tool for checking assumptions about a variable. 
+
+
+```{r}
+format_pdp_plot <- function(model, variable) {
+    plot <- pdp::partial(model, pred.var = variable, plot = TRUE, plot.engine = "ggplot2")
+    plot <- plot +
+        theme_bw() + 
+        theme(
+            panel.grid = element_blank(),
+            axis.title.y = element_blank()
+        )
+        
+    return (plot)
+}
+pdp1 <- format_pdp_plot(rf, "elevation_median")
+pdp2 <- format_pdp_plot(rf, "elevation_sd")
+pdp3 <- format_pdp_plot(rf, "day_of_year")
+pdp4 <- format_pdp_plot(rf, "pland_09_savanna")
+pdp5 <- format_pdp_plot(rf, "year")
+pdp6 <- format_pdp_plot(rf, "pland_13_urban")
+pdp7 <- format_pdp_plot(rf, "pland_08_woody_savanna")
+pdp8 <- format_pdp_plot(rf, "pland_12_cropland")
+pdp9 <- format_pdp_plot(rf, "pland_10_grassland")
+```
+
+```{r PDP plot, warning=FALSE}
+combined_pdp <- (pdp1 + pdp2 + pdp3) / (pdp4 + pdp5 + pdp6) / (pdp7 + pdp8 + pdp9)
+
+combined_pdp + plot_annotation(
+  title = 'Partial Dependence Plots',
+  subtitle = 'The top 9 variables ranked by importance in the random forest'
+)
+```
+There are a few interesting trends here:
+ + The model predicts a higher encounter rate when the elevation is higher, and when the standard deviation of the elevation in a near a checklist is higher.
+ + The cropland and woody savanna partial dependence plots appear to be mirrors of each other.
+ + Lower predicted encounter rates in all urban areas.
+ + A depressing decrease in encounter rate from 2010-2019 (this could also be interpreted as an overall increase in eBird data resulting in more checklists from backyard birders who may be less likely to see a Nuthatch).
+ + A higher predicted encounter rate later in the month of May - does breeding season start later for the Nuthatch?
+ 
+As with most plots of regression variables on their own - extreme caution should be taken when trying to interpret these causally. The calculation of a pdp holds every other variable constant, so we lose any interation between the variables. 
 
 ## Plotting Encounter Rate
 
-```{r}
+And finally - let's plot the predicted encounter rate as a raster map on Minnesota. Essentially we want to associate each grid cell in Minnesota with the land and elevation variables. For this plot we will fix the month and the day of the year.
+
+```{r Encounter rate data frame}
 # add effort covariates to prediction 
 pred_surface_eff <- pred_surface %>% 
     mutate(month = 5,
@@ -299,12 +346,12 @@ pred_er <- bind_cols(pred_surface_loc, encounter_rate = pred_rf_cal$pred_rf_cal)
   mutate(encounter_rate = pmin(pmax(encounter_rate, 0), 1))
 ```
 
-```{r}
+Then we turn that prediction data frame into spatial features and then rasterize it. Finally, we project the raster into the format the map is expecting.
+
+```{r warning=FALSE}
 r_pred <- pred_er %>% 
-  # convert to spatial features
   st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>% 
   st_transform(crs = projection(prediction_surface_raster)) %>% 
-  # rasterize
   rasterize(prediction_surface_raster)
 r_pred <- r_pred[[-1]]
 r_pred_proj <- projectRaster(r_pred, crs = map_proj$proj4string, method = "ngb")
@@ -313,15 +360,9 @@ r_pred_proj_spdf = as(r_pred_proj, "SpatialPixelsDataFrame")
 raster_df <- as.data.frame(r_pred_proj_spdf)
 ```
 
-```{r}
-mn_bound <- read_sf(here("data", "bdry_state_of_minnesota.gpkg")) %>% 
-  st_transform(crs = map_proj) %>% 
-  st_geometry()
-    
-```
+And plot it - with a similar zooming method that I used in the last ebird post.
 
-
-```{r}
+```{r, warning=FALSE}
 
 get_display_window <- function(lat, long, zoom) {
   zoom_to <- c(lat, long)
@@ -371,6 +412,12 @@ raster_df %>%
           axis.title = element_blank()
           )
 
-
-
 ```
+We observe a low predicted encounter rate in the western croplands. The the bulk of the region with high predicted encounter rates corresponds to [bird conservation region 23](https://nabci-us.org/resources/bird-conservation-regions-map/) (prairie-woodland transition) - seen below from the website [https://umgljv.org/planning/state-by-bcr-plans/](https://umgljv.org/planning/state-by-bcr-plans/). 
+
+ ![Upper Midwest BCR regions](../output/BCRs-720.png)
+
+### Final thoughts
+
+This post explored using eBird checklist data along with habitat variables to predict the chance of encountering the White Breasted Nuthatch in Minnesota. It would be interesting to explore these methods with a more rare species like the Hermit Thrush (one of my faves) - or to compare the encounter rate maps calculated for each month to published species extent maps. 
+
